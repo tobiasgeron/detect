@@ -1,6 +1,6 @@
 # DETECT
 
-Developed by Tobias Géron at the University of Toronto. Created Summer 2024. Last updated Mar 2025. This code was last tested using the Weekly 2024_42 image on the RSP. Please see below for a full list of package compatibility.
+Developed by Tobias Géron at the University of Toronto. Created Summer 2024. Last updated June 2025. This code was last tested using the Weekly 2024_42 image on the RSP. Please see below for a full list of package compatibility.
 
 DETECT (Detection Efficiency and Threshold Estimation for Characterization of Transients) was developed to help better quantify detection thresholds with the Rubin pipelines. The current Rubin pipelines define detections with a simple SNR threshold. However, this becomes difficult when there is a bright background galaxy, or when the datapoint in question has a magnitude around the detection threshold (~23-24). How confident are we that this detection is real?
 
