@@ -4,6 +4,13 @@ This code was last tested using the Weekly 2024_42 image.
 
 
 TODO: Allow users to bin data using coadds. See DP02_09a_Custom_Coadd
+
+
+
+CHANGE LOG
+----------
+22 May 2025: Adjusted find_tresholds(). Now takes multiple p0's that it will all test, and choose the best one.
+9 July 2025: Updated a lot of code for DP1. Especially the code aroudn source detection and image subtraction.
 '''
 
 
@@ -30,6 +37,9 @@ from scipy.ndimage import generic_filter, median_filter, uniform_filter
 from scipy.optimize import curve_fit
 from multiprocessing import Pool
 from functools import partial
+import yaml
+import logging
+
 
 
 # Various LSST pipelines
@@ -38,9 +48,17 @@ import lsst.afw.image as afwImage
 import lsst.afw.math as afwMath
 import lsst.afw.geom as afwGeom
 from lsst.daf.butler import Butler
+import lsst.daf.base as dafBase
 import lsst.geom as geom
 import lsst.afw.table as afwTable
 from lsst.rsp import get_tap_service, retrieve_query
+import lsst.meas.algorithms as measAlgorithms
+
+
+# Source detection and measurement
+from lsst.meas.algorithms.detection import SourceDetectionTask
+from lsst.meas.deblender import SourceDeblendTask
+from lsst.meas.base import SingleFrameMeasurementTask
 
 
 # Source injection
@@ -53,6 +71,11 @@ from lsst.ip.diffim.subtractImages import AlardLuptonSubtractTask, AlardLuptonSu
 
 # Forced photometry
 import lsst.meas.base as measBase
+
+
+
+
+
 
 
 
@@ -180,6 +203,27 @@ def intersection(list1, list2):
 
 
 
+
+def distance_to_edge(coords_sky, exposure):
+    '''
+    Will calculate the minimum distance from the target to the edge of the image. Input coordinates in RA/Dec, output in pixels
+
+    Calling example:
+
+    distance_to_edge([ra,dec], calexp)
+    
+    '''
+    exposure_shape = exposure.height, exposure.width
+    xmin, ymin = exposure.image.getX0(), exposure.image.getY0()
+    xmax = xmin + exposure_shape[1]
+    ymax = ymin + exposure_shape[0]
+    
+    x,y = sky_to_pixel(coords_sky, exposure.getWcs())
+    
+    diffs = [np.abs(xmin-x), np.abs(xmax-x), np.abs(ymin-y), np.abs(ymax-y)]
+    return np.min(diffs)
+
+    
 def plot_image(exposure, fig = '', ax = '', scale = 'asinh', vmin = np.nan, vmax = np.nan, vmin_p = 10, vmax_p = 98, title = '', plot_ticks = True, plot_colorbar = True, coords = [], coords_cols = [], zoom_target = [], zoom_size = 40, fontsize = 12):
     """
     image should be a lsst.afw.image._image.ImageF
@@ -400,7 +444,10 @@ def cutout_butler(butler, dataId, ra, dec, dataset_type = 'calexp', size=101):
 
 
 
-def filter_sources(sources, cutout, buffer = 2):
+def filter_sources_v0(sources, cutout, buffer = 2):
+    '''
+    This is the old method of filtering the source catalogue. Keeping it here for posterity.
+    '''
     # Only include sources that are within a cutout.
 
     schema = sources.schema
@@ -427,6 +474,59 @@ def filter_sources(sources, cutout, buffer = 2):
 
 
 
+def filter_sources(sources, cutout, buffer = 2):
+    '''
+    This will only keep only sources whose entire footprint is within cutout bbox.
+    
+    CAVEAT: This does assume that the pixel scale at which the sources were detected is the 
+    same as in the current cutout, as we use the wcs of the cutout, but the footprint 
+    of the sources, which is based on the pixel scale of the original image they 
+    were detected on. But templates and visit images might be on different grids,
+    they do still have the sane pixel scale, so I think this is fine.
+    '''
+    # Only include sources that are within a cutout.
+
+    schema = sources.schema
+    sources_temp = afwTable.SourceCatalog(schema)
+    
+    cutout_shape = cutout.height, cutout.width
+    xmin, ymin = cutout.image.getX0(), cutout.image.getY0()
+    xmax = xmin + cutout_shape[1]
+    ymax = ymin + cutout_shape[0]
+
+    wcs = cutout.getWcs()
+    
+    for s in sources:
+        # Get source sky coordinates
+        ra_deg = s['coord_ra'].asDegrees()
+        dec_deg = s['coord_dec'].asDegrees()
+        sky_pos = geom.SpherePoint(ra_deg * geom.degrees, dec_deg * geom.degrees)
+
+        # Convert sky pos to pixel in cutout coords
+        pix_pos = wcs.skyToPixel(sky_pos)
+        x_cen, y_cen = pix_pos.getX(), pix_pos.getY()
+
+        # Get footprint bbox in source native pixel coords
+        fp = s.getFootprint()
+        fp_bbox = fp.getBBox()
+
+        # Since we do not know original orientation, let's calculate the worst possible radius.
+        #Get max of width/height and divide by 2 to get one side. 
+        # Then, calculate length of hypotenuse
+        fp_side = np.max([fp_bbox.getWidth(), fp_bbox.getHeight()])/2 
+        fp_maxlength = np.sqrt(fp_side**2+fp_side**2) 
+        
+        # Check if footprint bbox fully inside cutout bbox around source pixel center
+        if (x_cen - fp_maxlength - buffer >= xmin and x_cen + fp_maxlength + buffer <= xmax and
+            y_cen - fp_maxlength - buffer >= ymin and y_cen + fp_maxlength + buffer <= ymax):
+
+            sources_temp.append(s)
+    
+    sources = sources_temp.copy(deep=True)
+    return sources
+    
+
+
 def in_exposure(sky_coord, cutout, buffer = 0):
     cutout_shape = cutout.height, cutout.width
     xmin, ymin = cutout.image.getX0(), cutout.image.getY0()
@@ -443,7 +543,171 @@ def in_exposure(sky_coord, cutout, buffer = 0):
     
     
 
+def compare_images(diff1,diff2):
+    '''
+    Used for debugging purposes. This will compare two images that are aligned. Useful for checked whether e.g. image subtraction
+    worked.
+    '''
 
+
+    diff1 = diff1.image.array.flatten()
+    diff2 = diff2.image.array.flatten()
+    
+    delta = np.abs(diff1 - diff2)
+
+    median = np.nanmedian(delta)
+    mean = np.nanmean(delta)
+    p75 = np.nanpercentile(delta,75)
+    p99 = np.nanpercentile(delta,99)
+
+    print(f'Median difference = {median:.2f}; Mean difference = {mean:.2f}; 75th percentile difference = {p75:.2f}; 99th percentile difference = {p99:.2f}')
+
+
+
+
+def warp_exposure(exposure1, exposure2, config = None):
+    '''
+    Will warp exposure1 to the grid and Psf of exposure2.
+    E.g., if you want to align a template with a calexp, do:
+    warp_exposure(template, calexp)
+    '''
+
+    if config == None:
+        config = afwMath.Warper.ConfigClass()
+        config.warpingKernelName = "lanczos5"
+
+    warper = afwMath.Warper.fromConfig(config)
+    bbox = exposure2.getBBox()
+    xyTransform = afwGeom.makeWcsPairTransform(exposure1.wcs,exposure2.wcs)
+    warpedPsf = measAlgorithms.WarpedPsf(exposure1.psf, xyTransform)
+    warped = warper.warpExposure(exposure2.wcs, exposure1, destBBox = bbox)
+    warped.setPsf(warpedPsf)
+    warped = copy.deepcopy(warped)
+
+    return warped
+
+
+
+
+def compare_mask_dictionaries(exp1, exp2):
+    '''
+    Looks at the Mask Plane Dictionaries of both exposureF, and see whether they match.
+    If not, it will error, and note where there is a mismatch.
+    '''
+    exp1_dict = exp1.mask.getMaskPlaneDict()
+    exp2_dict = exp2.mask.getMaskPlaneDict()
+    
+    if exp2_dict != exp1_dict:
+        print("Mask dictionaries do not match.")
+        print("Exp1-only keys:", set(exp1_dict) - set(exp2_dict))
+        print("Exp2-only keys:", set(exp2_dict) - set(exp1_dict))
+        print("Mismatched values:")
+        for key in set(exp1_dict).intersection(exp2_dict):
+            if exp1_dict[key] != exp2_dict[key]:
+                print(f"  {key}: source={exp1_dict[key]}, target={exp2_dict[key]}")
+        raise RuntimeError("Failed to match mask plane dictionaries")
+    else:
+        print("Mask plane dictionaries match.")
+
+
+def set_logging_level(level):
+    '''
+    Allows users to set the logging level of various Rubin pipelines
+    '''
+    
+    assert level in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], "level should be set to either DEBUG, INFO, WARNING, ERROR, CRITICAL"
+
+    task_names = ['lsst.alardLuptonSubtract', 'lsst.visitInjectTask',
+             'lsst.measurement','lsst.sourceDetection','lsst.sourceDeblend']
+
+    
+    for tn in task_names:
+        logger = logging.getLogger(tn)
+        level_ = getattr(logging, level)
+        logger.setLevel(level_)  
+    
+
+
+
+### ================ ###
+### Source detection ###
+### ================ ###
+
+
+def source_detection(exposure, threshold_value = 5, sky_source_frac = 0.3, sky_source_method = 'low_flux'):
+    '''
+    This will take an exposure, and run the source detection, deblending, and measurement pipelines on it.
+    It returns a sourceCatalog that is configured in the correct way to use as input in the subtract_image pipeline.
+
+    Since DP1, when you query the source tables directly, it doesn't give you the tables in the correct format for image subtraction.
+    Thus, we have to detect, deblend, and measure ourselves.
+
+    Note that this will change some of the mask planes on the original exposureF! Because of this,
+    it is highly recommended that you run this early. Otherwise other pipelines might complain
+    that something changed halfway through. 
+    '''
+
+    assert sky_source_method in ['low_flux','random','none'],"sky_source_selection_method in ['low_flux','random','none']"
+
+    ### Clear the exposure of any current detections
+    exposure.mask.removeAndClearMaskPlane('DETECTED')
+
+    ### Setup the schema
+    schema = afwTable.SourceTable.makeMinimalSchema()
+    raerr = schema.addField("coord_raErr", type="F")
+    decerr = schema.addField("coord_decErr", type="F")
+    isPrimary = schema.addField("detect_isPrimary", type = 'F') #This sets it all to NaN though.
+    skySource = schema.addField("sky_source", type = 'Flag') #This sets it all to Nan though.
+    algMetadata = dafBase.PropertyList()
+
+
+    ### Setup the different tasks
+    config = SourceDetectionTask.ConfigClass()
+    config.thresholdValue = threshold_value
+    config.thresholdType = "stdev"
+    sourceDetectionTask = SourceDetectionTask(schema=schema, config=config)
+    sourceDeblendTask = SourceDeblendTask(schema=schema)
+    config = SingleFrameMeasurementTask.ConfigClass()
+    sourceMeasurementTask = SingleFrameMeasurementTask(schema=schema,
+                                                       config=config,
+                                                       algMetadata=algMetadata)
+    tab = afwTable.SourceTable.make(schema)
+
+
+    ### Run the tasks
+    result = sourceDetectionTask.run(tab, exposure)
+    sources = result.sources
+    sourceDeblendTask.run(exposure, sources)
+    sourceMeasurementTask.run(measCat=sources, exposure=exposure)
+    sources = sources.copy(True)
+
+
+    ### Set some sources as sky_source
+    sky_source_key = schema["sky_source"].asKey()
+    num_sources = len(sources)
+
+    # None
+    if sky_source_method == 'none':
+        sky_source_frac = 0
+
+    # Low flux
+    if sky_source_method == 'low_flux':
+        fluxes = sources["base_PsfFlux_instFlux"]
+        low_flux_cut = np.percentile(fluxes, sky_source_frac*100)
+        sky_indices = [i for i, f in enumerate(fluxes) if f < low_flux_cut]
+
+    # Random
+    elif sky_source_method in ['random','none']:
+        sky_indices = np.random.choice(num_sources, size=int(sky_source_frac * num_sources), replace=False)
+
+    for i, record in enumerate(sources):
+        record.set(sky_source_key, i in sky_indices)
+
+
+    return sources
+
+
+    
 
 ### ========= ###
 ### Injection ###
@@ -517,59 +781,24 @@ def create_injection_catalog(ra, dec, source_type, mag, n = [], q = [],
 
 
 
-def inject_source(image, injection_catalog, band = 'g', butler_config = 'dp02', butler_collections = '2.2i/runs/DP0.2',
-                  injection_catalog_name = 'injection_catalog', log_level = 30):
+def inject_source(image, injection_catalog, band = 'g'):
     '''
     Will inject a source catalog into an image. Automatically handles the ingestion of the catalog, reloading, task configuration and running. 
 
 
     Updates
     2024-11-08: Noticed that you don't have to ingest and reload injection catalogs. 
+    2025-07-08: See Step -1. Revisit this change once finalized image subtraction pipelines from Rubin are made available
     '''
+    image = copy.deepcopy(image) #Make sure we do not overwrite anything
 
-
-    
-    """ 
-    ### Step 1: Ingest the injection catalog
-    user = os.getenv("USER")
-    INJECTION_CATALOG_COLLECTION = f"u/{user}/{injection_catalog_name}_{int(time.time())}_{random.randint(0,10000)}" #_{random.randint(0,100)} is for when you're running multiple notebooks at the same time
-    writeable_butler = Butler(butler_config, writeable=True)
-    
-    try:
-        my_injected_datasetRefs = ingest_injection_catalog(
-            writeable_butler=writeable_butler,
-            table=injection_catalog,
-            band=band,
-            output_collection=INJECTION_CATALOG_COLLECTION,
-            log_level = log_level
-        )
-    except ConflictingDefinitionError:
-        print(f"Found an existing collection named INJECTION_CATALOG_COLLECTION={INJECTION_CATALOG_COLLECTION}.")
-        print("\nNOTE THAT IF YOU SEE THIS MESSAGE, YOUR CATALOG WAS NOT INGESTED."\
-              "\nYou may either continue with the pre-existing catalog, or choose a new"\
-              " name and re-run the previous cell and this one to ingest a new catalog.")
-
-
-    ### Step 2: Load input injection catalogs.
-    butler = Butler(butler_config, collections=butler_collections)
-    injection_refs = butler.registry.queryDatasets(
-        "injection_catalog",
-        band=band,
-        collections=INJECTION_CATALOG_COLLECTION,
-    )
-    injection_catalog = [
-        butler.get(injection_ref) for injection_ref in injection_refs
-    ]
-
-    """
-
-    ### Step 3: Configure Task
+    ### Step 1: Configure Task
 
     inject_config = VisitInjectConfig()
     #inject_config.stamp_prefix='data/' I don't think we need this? 
     inject_task = VisitInjectTask(config=inject_config)
     
-    ### Step 4: Run Task
+    ### Step 2: Run Task
     psf = image.getPsf()
     photo_calib = image.getPhotoCalib()
     wcs = image.getWcs()
@@ -582,12 +811,19 @@ def inject_source(image, injection_catalog, band = 'g', butler_config = 'dp02', 
         wcs=wcs,
     )
 
-    ### Step 5: return
+    ### Step 5: obtained parameters from output
     injected_exposure = injected_output.output_exposure
     injected_catalog = injected_output.output_catalog
-    return injected_exposure, injected_catalog
 
 
+    ### Step -1: Before we return, copy initial image and overwrite pixel values. This keeps all the mask planes as they
+    # were before, and only pixel values are adjusted. Otherwise the improvised image subtraction pipelines complain. 
+    # Though not sure if I want to actually do this.
+    # TODO: Once the finalised image subtraction pipelines from Rubin are made available, revisit this decision.
+    image_copy = copy.deepcopy(image)
+    image_copy.image.array[:] = injected_exposure.image.array[:]
+        
+    return image_copy, injected_catalog
 
 
 
@@ -668,15 +904,15 @@ def find_smoothened_injection_locations(exposure, coor, smooth_function = 'media
 
 
 def create_injection_locations(science_exposure, n_injections, max_per_round = 100, sn_position = [], template_exposure = [], method = 'smooth', plot = False, plot_zoom = False, 
-                              plot_zoom_size = 40, smooth_function = 'median', smooth_filter_size = 10, p_threshold = 5, psf_flux_threshold = 0.0001, psf_sigma = 3,
-                              max_dist = 20, radius_increment = 2, min_dist_across_iterations = 1, n_attempts = 10):
+                              plot_zoom_size = 40, smooth_function = 'median', smooth_filter_size = 10, p_threshold = 5, psf_flux_threshold = 0.001, psf_sigma = 0,
+                              max_dist = 50, radius_increment = 2, min_dist_across_iterations = 0.4, n_attempts = 10):
 
     '''
     sn_position must be in ra/dec
 
     max_dist is maximum distance of injection locations to SN in arcsec
 
-    min_dist_across_iterations: even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within X arcsec as unuseable.
+    min_dist_across_iterations: in arcsec. Even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within X arcsec as unuseable.
 
     TODO: make separate arguments for minimum distance to SN?
     '''
@@ -823,7 +1059,7 @@ def create_injection_list(locs, min_dists, n_injection, max_per_round = 1000, mi
     min_dists: list of how far away each injection site has to be from others
     n_injection: how many to select in total
     max_per_round: how many injections to maximum put in one round. Can set this to 1 if you want to disable this feature
-    min_dist_across_iterations: even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within X arcsec as unuseable.
+    min_dist_across_iterations: in arcsec. even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within X arcsec as unuseable.
 
 
     Def will return a list of lists. Every sublist will be a x,y pair that can be injected together.
@@ -1072,7 +1308,8 @@ def create_min_dists(exp, locs, psf_flux_threshold = 0.0001, psf_sigma = 3, radi
 ### =========== ###
 
 
-def subtract_images(template_exp, science_exp, sources, subtraction_config = None):
+
+def subtract_images(template_exp, science_exp, sources, apply_source_filtering = True, subtraction_config = None):
     '''
     template_exp should be an lsst.afw.image._exposure.ExposureF of 
     the template image. 
@@ -1081,30 +1318,45 @@ def subtract_images(template_exp, science_exp, sources, subtraction_config = Non
     sources should be an lsst.afw.table.SourceCatalog containing sources
     in the image. The AlardLuptonSubtractTask uses it to match. 
 
-    Note from the DP02_14 tutorial:
-    In w_2024_38, the source selector within AlardLuptonSubtractTask was changed. This new selector uses 
-    a value that is not included by default in the DP0.2 catalogs, so need to add it manually. Do it in 
-    a try:except block to avoid errors. 
+    If template and science are not aligned, will automatically align them. Additionally, if the template has the
+    OTHERDET or THISDET mask planes, the Rubin subtraction pipelines will error. I solve this by realigning the template
+    again, as this gets rid of those mask planes. 
     '''
 
+    # To make sure we do not overwrite anything
+    template_exp = copy.deepcopy(template_exp)
+    science_exp = copy.deepcopy(science_exp)
+    
     # Configure
     if subtraction_config == None:
         config = AlardLuptonSubtractConfig()
     else:
         config = subtraction_config
 
-        
-    try:
-        config.sourceSelector.value.unresolved.name = 'base_ClassificationExtendedness_value'
-    except:
-        pass
-    alTask = AlardLuptonSubtractTask(config=config)
+    # Filter sources, if needed
+    if apply_source_filtering: 
+        sources = filter_sources(sources, science_exp)
+        sources = filter_sources(sources, template_exp)
+
+    # Check if I need to warp the template
+    # Either if wcs is not the same, or it has the OTHERDET mask plane.
+    if template_exp.getWcs() != science_exp.getWcs() or 'OTHERDET' in list(template_exp.mask.getMaskPlaneDict().keys()) or 'THISDET' in list(template_exp.mask.getMaskPlaneDict().keys()):
+        template_exp = warp_exposure(template_exp,science_exp)
 
     
-    # Run
+    #match_mask_dictionaries(warped_template, inj_calexp)
+    
+    # The try-except is no longer needed since DP1
+    #try:
+    #    config.sourceSelector.value.unresolved.name = 'base_ClassificationExtendedness_value'
+    #except:
+    #    pass
+
+    alTask = AlardLuptonSubtractTask(config=config)
     diff = alTask.run(template_exp, science_exp, sources)
 
     return diff
+
 
 
 
@@ -1136,7 +1388,7 @@ def forced_photometry(exposure, coords, return_full = False):
     refWcs:  Wcs information, obtained from exposure.
 
 
-    See notebook tutorial 5 section 5. 
+    Note to self: DP1 has an updated method to do forced photometry. Update this? This new approach also includes aperture photometry etc. 
     '''
 
     if type(coords) == tuple: 
@@ -1193,10 +1445,19 @@ def forced_photometry(exposure, coords, return_full = False):
     
     ### Step 4: Save results and return
     df_forced = measCat.asAstropy().to_pandas()
-    df_forced['base_PsfFlux_SNR'] = df_forced['base_PsfFlux_instFlux'] / df_forced['base_PsfFlux_instFluxErr']
+    df_forced['base_PsfFlux_instSNR'] = df_forced['base_PsfFlux_instFlux'] / df_forced['base_PsfFlux_instFluxErr']
+
+
+    njy = instflux_to_njy(df_forced['base_PsfFlux_instFlux'], [exposure] * len(df_forced))
+    njy_err = instflux_to_njy(df_forced['base_PsfFlux_instFluxErr'], [exposure] * len(df_forced))
+    df_forced['base_PsfFlux_nJy'] = njy
+    df_forced['base_PsfFlux_nJyErr'] = njy_err
+    df_forced['base_PsfFlux_SNR'] = np.array(njy)/np.array(njy_err)
+
+    
     if not return_full:    
         #This df contains a lot of information. Extract the important ones. We can also calculate the SNR:
-        df_forced = df_forced[['base_PsfFlux_instFlux','base_PsfFlux_instFluxErr','base_PsfFlux_SNR','base_PsfFlux_area']]
+        df_forced = df_forced[['base_PsfFlux_nJy','base_PsfFlux_nJyErr','base_PsfFlux_SNR','base_PsfFlux_instFlux','base_PsfFlux_instFluxErr','base_PsfFlux_instSNR','base_PsfFlux_area']]
 
     return df_forced
 
@@ -1238,14 +1499,19 @@ def inject_subtract_photometry(science_exposure, injection_mag, sources, injecti
         pixscale = science_exposure.getWcs().getPixelScale().asArcseconds()
         cutout_size_pix = int(cutout_size/pixscale)
         cutout_position = sn_position
+
+        science_cutout = cutout_exposure(science_exposure, cutout_position[0], cutout_position[1], size = cutout_size_pix, size_units = 'pixel')
+        template_cutout = cutout_exposure(template_exposure, cutout_position[0], cutout_position[1], size = cutout_size_pix+20, size_units = 'pixel')
+
     else:
         cutout_size_pix = int(np.min([science_exposure.width,science_exposure.height]))
         b = science_exposure.getBBox()
         cutout_position = (b.centerX, b.centerY)
         cutout_position = pixel_to_sky(cutout_position, wcs)
+
+        science_cutout = science_exposure
+        template_cutout = template_exposure
         
-    science_cutout = cutout_exposure(science_exposure, cutout_position[0], cutout_position[1], size = cutout_size_pix, size_units = 'pixel')
-    template_cutout = cutout_exposure(template_exposure, cutout_position[0], cutout_position[1], size = cutout_size_pix+20, size_units = 'pixel')
     
     
     for i in range(len(injection_locations)):
@@ -1430,9 +1696,9 @@ class recovery_curve_config:
         self.n_injections = 10
         self.max_inj_per_round = 100
         self.p_threshold = 5
-        self.psf_flux_threshold = 0.0001
-        self.psf_sigma = 3
-        self.min_dist_across_iterations = 1
+        self.psf_flux_threshold = 0.001
+        self.psf_sigma = 0
+        self.min_dist_across_iterations = 0.4
         self.injection_n_attempts = 10
         self.max_dist = 50
         self.inject_band = 'g'
@@ -1448,6 +1714,24 @@ class recovery_curve_config:
         self.plot = False
         self.expand_output = False
         self.n_jobs = 0
+
+
+    def save_settings(self, filename):
+        with open(filename, "w") as f:
+            yaml.dump(self.__dict__, f)
+
+
+    def load_settings(self, filename):
+        # Read settings file
+        with open(filename, "r") as f:
+            settings_dict = yaml.safe_load(f)
+        
+        # Set each attribute from the dict
+        for key, value in settings_dict.items():
+            setattr(self, key, value)
+    
+
+        
 
 
 def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_position, config = None):
@@ -1475,6 +1759,8 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
     assert config.sn_position_units in ['sky','pixel'], "config.sn_position_units can either be 'sky' or 'pixel'."
 
 
+    if np.isnan(sn_mag): #if sn_mag is NaN, just set it to 24. We only use it to sample the SN mags around it anyways.
+        sn_mag = 24
 
     if type(config.n_injections) == int:
         config.n_injections = [config.n_injections]*n_iterations
@@ -1539,7 +1825,7 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
 
     # Measure background
     df_background = measure_background(science_cutout, template_cutout, injection_locations, sources, subtraction_config = config.subtraction_config)
-    df_background = df_background.rename(columns = {'base_PsfFlux_instFlux' : 'background_PsfFlux_instFlux', 'base_PsfFlux_instFluxErr' : 'background_PsfFlux_instFluxErr'})
+    df_background = df_background.rename(columns = {'base_PsfFlux_nJy' : 'background_PsfFlux_nJy', 'base_PsfFlux_instFlux' : 'background_PsfFlux_instFlux', 'base_PsfFlux_nJyErr' : 'background_PsfFlux_nJyErr', 'base_PsfFlux_instFluxErr' : 'background_PsfFlux_instFluxErr'})
     df_background['background_nonzero_flag'] = [1 if (df_background['background_PsfFlux_instFlux'][i] - df_background['background_PsfFlux_instFluxErr'][i]) > 0 else 0 for i in range(len(df_background))]
 
     
@@ -1603,8 +1889,13 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
         if config.subtract_background:
             df_results['base_PsfFlux_instFlux'] = df_results['base_PsfFlux_instFlux'] - df_results['background_PsfFlux_instFlux']
             df_results['base_PsfFlux_instFluxErr'] = np.sqrt(df_results['base_PsfFlux_instFluxErr']**2 + df_results['background_PsfFlux_instFluxErr']**2)
-            df_results['base_PsfFlux_SNR'] = df_results['base_PsfFlux_instFlux'] / df_results['base_PsfFlux_instFluxErr']
+            df_results['base_PsfFlux_instSNR'] = df_results['base_PsfFlux_instFlux'] / df_results['base_PsfFlux_instFluxErr']
 
+            df_results['base_PsfFlux_nJy'] = df_results['base_PsfFlux_nJy'] - df_results['background_PsfFlux_nJy']
+            df_results['base_PsfFlux_nJyErr'] = np.sqrt(df_results['base_PsfFlux_nJyErr']**2 + df_results['background_PsfFlux_nJyErr']**2)
+            df_results['base_PsfFlux_SNR'] = df_results['base_PsfFlux_nJy'] / df_results['base_PsfFlux_nJyErr']
+
+        
         
         df_results['detected'] = [True if df_results.iloc[i]['base_PsfFlux_SNR'] > config.snr_threshold else False for i in range(len(df_results))]
         #df_results = df_results.reset_index(drop=True)
@@ -1636,7 +1927,7 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
 
 
 def recovery_summary(df):
-    df_summary = df.copy(deep=True)[['base_PsfFlux_instFlux', 'base_PsfFlux_instFluxErr', 'base_PsfFlux_SNR', 'sn_mag','detected','background_nonzero_flag']]
+    df_summary = df.copy(deep=True)[['base_PsfFlux_nJy', 'base_PsfFlux_nJyErr', 'base_PsfFlux_SNR', 'sn_mag','detected','background_nonzero_flag']]
     df_summary = df_summary.groupby('sn_mag').mean().reset_index().sort_values(by = 'sn_mag').reset_index(drop=True)
     return df_summary
 
@@ -1648,6 +1939,10 @@ def recovery_summary(df):
 ### Background ###
 ### ========== ###
 
+
+
+
+
 def measure_background(science, template, injection_locations, sources, subtraction_config = None):
     '''
     Background here means the difference image. Will subtract science and template, and then do forced photometry on 
@@ -1658,8 +1953,8 @@ def measure_background(science, template, injection_locations, sources, subtract
     
 
     # Subtract
-    sources = filter_sources(sources, template) #Only keep the sources that are actually also in the injected calexps cutout
-    sources = filter_sources(sources, science) #Only keep the sources that are actually also in the injected calexps cutout
+    sources = filter_sources(sources, template)
+    sources = filter_sources(sources, science) 
     diff = subtract_images(template, science, sources, subtraction_config = subtraction_config)
 
 
@@ -1669,11 +1964,12 @@ def measure_background(science, template, injection_locations, sources, subtract
 
         # Forced photometry
         results = forced_photometry(diff.difference, locs_sky)
-
-        results = results[['base_PsfFlux_instFlux','base_PsfFlux_instFluxErr']]
+        
+        results = results[['base_PsfFlux_nJy','base_PsfFlux_nJyErr', 'base_PsfFlux_instFlux','base_PsfFlux_instFluxErr']]
         results['injection_id'] = [f'{i}_' + str(k) for k in list(range(len(results)))]
     
         df_results = pd.concat([df_results,results])
+
         
     return df_results.reset_index(drop=True)
 
@@ -1683,11 +1979,13 @@ def measure_background(science, template, injection_locations, sources, subtract
 def estimate_sn_background(science, template, sources, sn_position, n_injections = np.inf,
                            sn_position_units = 'sky', cutout_size = np.nan, smooth_function = 'median', 
                            smooth_filter_size = 10, p_threshold = 2, max_dist = 10, psf_flux_threshold = 0.0001, 
-                           psf_sigma = 3, radius_increment = 2, plot = False, subtraction_config = None):
+                           psf_sigma = 1, radius_increment = 2, plot = False, subtraction_config = None):
 
     '''
     cutout_size is in arcsec
     '''
+    science = copy.deepcopy(science) # To make sure we don't change anything directly
+    template = copy.deepcopy(template)
 
     
     assert sn_position_units in ['sky','pixel'], "sn_position_units can either be 'sky' or 'pixel'."
@@ -1696,30 +1994,35 @@ def estimate_sn_background(science, template, sources, sn_position, n_injections
     if sn_position_units == 'pixel': #change it to sky position units
         sn_position = pixel_to_sky(sn_position, wcs = science.getWcs())
 
+    cutout_position = sn_position
+    
 
     # Create the cutouts
     wcs = science.getWcs()
     if ~np.isnan(cutout_size):
         pixscale = wcs.getPixelScale().asArcseconds()
         cutout_size_pix = int(cutout_size/pixscale)
+
+        science_cutout = cutout_exposure(science, cutout_position[0], cutout_position[1], size = cutout_size_pix, size_units = 'pixel')
+        template_cutout = cutout_exposure(template, cutout_position[0], cutout_position[1], size = cutout_size_pix+20, size_units = 'pixel')
+
     else:
         cutout_size_pix = int(np.min([science.width,science.height]))
+        science_cutout = science
+        template_cutout = template
 
     
-    cutout_position = sn_position
-    science_cutout = cutout_exposure(science, cutout_position[0], cutout_position[1], size = cutout_size_pix, size_units = 'pixel')
-    template_cutout = cutout_exposure(template, cutout_position[0], cutout_position[1], size = cutout_size_pix+20, size_units = 'pixel')
-
+    
 
 
     # Find all pixels that are within p_threshold percentile within the SN location
-    injection_locations, _ = find_smoothened_injection_locations(template, sn_position, smooth_function = smooth_function, 
+    injection_locations, _ = find_smoothened_injection_locations(template_cutout, sn_position, smooth_function = smooth_function, 
                                                                smooth_filter_size = smooth_filter_size, p_threshold = p_threshold, 
                                                                output_units = 'sky')
     
     # Remove pixels that are too close (or too far away) from SN. Might be some leaking. 
-    min_dists = create_min_dists(science, injection_locations, psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
-    sn_min_dist = create_min_dists(science, [sn_position], psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
+    min_dists = create_min_dists(science_cutout, injection_locations, psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
+    sn_min_dist = create_min_dists(science_cutout, [sn_position], psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
     injection_locations, min_dists = filter_injection_locations(injection_locations,min_dists,[sn_position], sn_min_dist, remove_max_dists = [max_dist/3600])
 
     
@@ -1729,15 +2032,7 @@ def estimate_sn_background(science, template, sources, sn_position, n_injections
     
     
     # Measure background at these locations
-    df_background = measure_background(science, template, [injection_locations], sources, subtraction_config = subtraction_config)
-
-
-    # Converty to njy
-    njy = instflux_to_njy(df_background['base_PsfFlux_instFlux'], [science] * len(df_background))
-    njy_err = instflux_to_njy(df_background['base_PsfFlux_instFluxErr'], [science] * len(df_background))
-    df_background['base_PsfFlux_nJy'] = njy
-    df_background['base_PsfFlux_nJyErr'] = njy_err
-
+    df_background = measure_background(science_cutout, template_cutout, [injection_locations], sources, subtraction_config = subtraction_config)
     df_background = df_background.drop(['base_PsfFlux_instFlux', 'base_PsfFlux_instFluxErr'], axis=1)
 
 
@@ -1758,6 +2053,9 @@ def estimate_sn_background(science, template, sources, sn_position, n_injections
         plt.show()
 
     return df_background
+
+
+
 
 
 def measure_snr_on_img(img, sn_position, zoom_size = 40, plot = False, stepsize = 1):
@@ -1863,17 +2161,18 @@ def piecewise_solver(y,x1,x2):
 
 
 
-
-
-def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = [22,25], method = 'piecewise', sn_mag = np.nan, plot = False):
+def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = [[20,26], [22,25], [23,24], [18,30]], method = 'piecewise', sn_mag = np.nan, plot = False):
     '''
     For every item in detection_fraction_thresholds, find the lowest mag that has a higher detection fraction.
+    p0 can be a list with initial condition values, e.g.: [22,25]. Or, it can be a list of lists, with multiple p0's to test. Will select the one with the best fit 
     '''
 
     assert method in ['empirical','piecewise']
 
     if method == 'empirical':
         d = {}
+
+        df_results = df_results.sort_values(by = 'sn_mag').reset_index(drop=True)
         
         for ft in detection_fraction_thresholds: 
             idx = np.where(df_results['detected'] >= ft)[0] #df is ordered on sn mag, take the index of the highest sn mag where this is true
@@ -1892,7 +2191,27 @@ def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = 
         xs_data = np.array(df_results['sn_mag'])
         ys_data = np.array(df_results['detected'])
 
-        popt, _ = curve_fit(piecewise, xs_data, ys_data, p0=p0)
+        sq_errors = []
+        popts = []
+
+        if len(np.array(p0).shape) == 1:
+            p0 = [p0]
+        
+        for p0_temp in p0:
+
+            try:
+                popt, _ = curve_fit(piecewise, xs_data, ys_data, p0=p0_temp)
+                sq_error = sum((piecewise(xs_data, *popt) - ys_data)**2) #Squared errors
+    
+                popts.append(popt)
+                sq_errors.append(sq_error)
+            except:
+                continue
+
+        #Select the one with the most minimal squared error
+        idx = np.argmin(sq_errors)
+        popt = popts[idx]
+            
 
         d = {}
         for ft in detection_fraction_thresholds: 
@@ -1926,6 +2245,8 @@ def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = 
 
 
 
+
+
 ### ================ ###
 ### Unit conversions ###
 ### ================ ###
@@ -1954,7 +2275,10 @@ def njy_to_mag(njy):
     
     mags = []
     for i in njy:
-        mag = (i*u.nJy).to(u.ABmag).value
+        if i < 0:
+            mag = np.nan
+        else:
+            mag = (i*u.nJy).to(u.ABmag).value
         mags.append(mag)
 
     if single_target:
