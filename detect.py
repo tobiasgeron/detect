@@ -1,16 +1,20 @@
 '''
-Developed by Tobias Geron at the University of Toronto. Created Summer 2024. Last updated Mar 2025. 
-This code was last tested using the Weekly 2024_42 image. 
+Developed by Tobias Geron at the University of Toronto. Started Summer 2024. Last updated Mar 2026. 
+This code was last tested using the r29.1.1 image on the RSP. 
+It is highly recommended to load a large batch (4 CPU and 16 GB RAM). 
 
 
 TODO: Allow users to bin data using coadds. See DP02_09a_Custom_Coadd
+Return covariance parameters on fit
 
 
 
 CHANGE LOG
 ----------
 22 May 2025: Adjusted find_tresholds(). Now takes multiple p0's that it will all test, and choose the best one.
-9 July 2025: Updated a lot of code for DP1. Especially the code aroudn source detection and image subtraction.
+9 July 2025: Updated a lot of code for DP1. Especially the code around source detection and image subtraction.
+15 January 2026: Added an option to automate saving of results. A lot of bugfixes.
+9 March 2026: Added docstrings.
 '''
 
 
@@ -39,8 +43,6 @@ from multiprocessing import Pool
 from functools import partial
 import yaml
 import logging
-
-
 
 # Various LSST pipelines
 import lsst.afw.display as afwDisplay
@@ -87,6 +89,24 @@ import lsst.meas.base as measBase
 
 # General functions needed throughout
 
+
+def check_package_versions():
+    
+    import numpy
+    import pandas
+    import matplotlib
+    import tqdm
+    import astropy
+    import scipy
+    import yaml
+    
+    print("numpy version:", numpy.__version__)
+    print("pandas version:", pandas.__version__)
+    print("matplotlib version:", matplotlib.__version__)
+    print("tqdm version:", tqdm.__version__)
+    print("astropy version:", astropy.__version__)
+    print("scipy version:", scipy.__version__)
+    print("pyyaml version:", yaml.__version__)
 
 
 def pixel_to_sky(coords_pix, wcs):
@@ -262,6 +282,8 @@ def plot_image(exposure, fig = '', ax = '', scale = 'asinh', vmin = np.nan, vmax
         vmin = np.nanpercentile(image.array, vmin_p)
     if np.isnan(vmax):
         vmax = np.nanpercentile(image.array, vmax_p)
+    if vmin == vmax:
+        vmax += 0.01*vmin
 
 
 
@@ -296,6 +318,19 @@ def plot_image(exposure, fig = '', ax = '', scale = 'asinh', vmin = np.nan, vmax
 def plot_image_v2(exposure, fig = '', ax = '', scale = 'asinh', vmin = np.nan, vmax = np.nan, vmin_p = 10, vmax_p = 99.9999, title = '', plot_ticks = True, plot_colorbar = True, coords = [], coords_cols = [], coords_size = [], zoom_target = [], zoom_size = 40, cmap = 'gray', fontsize = 12, plot_contour = False, contour_levels = 0, contour_smooth_size = 50, contour_alpha = 1):
     """
     Update to plot_image to use plt.imshow instead of the built-in awfDisplay to allow for more customisation.
+
+    This will plot images on pixel axes by default. If you want to plot using RA/Dec axes, you can do:
+    
+    from astropy.wcs import WCS
+    
+    fig = plt.figure()
+    wcs_mpl = WCS(exposure.getWcs().getFitsMetadata())
+    ax = fig.add_subplot(1, 2, 1, projection=wcs_mpl)
+    ax.set_xlabel("RA [deg]")
+    ax.set_ylabel("Dec [deg]")
+
+    and then pass ax to plot_image_v2
+
     """
 
     assert scale in ['asinh', 'function', 'functionlog', 'linear', 'log', 'logit', 'symlog'], ''
@@ -326,6 +361,8 @@ def plot_image_v2(exposure, fig = '', ax = '', scale = 'asinh', vmin = np.nan, v
         vmin = np.nanpercentile(image.array, vmin_p)
     if np.isnan(vmax):
         vmax = np.nanpercentile(image.array, vmax_p)
+    if vmin == vmax:
+        vmax += 0.01*vmin
 
     exposure_extent = (exposure.getBBox().beginX, exposure.getBBox().endX,
                  exposure.getBBox().beginY, exposure.getBBox().endY)
@@ -384,8 +421,7 @@ def cutout_exposure(exposure, ra, dec, size = 101, size_units = 'pixel'):
 
     wcs = exposure.getWcs()
     
-    assert exposure.width >= size, f"The size of the full exposure {exposure.width} is smaller than the desired cutout."
-    assert exposure.height >= size, f"The size of the full exposure {exposure.height} is smaller than the desired cutout."
+    
     assert size_units in ['sky','pixel'], "size_units can either be 'sky' or 'pixel'"
 
 
@@ -393,6 +429,10 @@ def cutout_exposure(exposure, ra, dec, size = 101, size_units = 'pixel'):
     if size_units == 'sky':
         pixscale = exposure.getWcs().getPixelScale().asArcseconds()
         size = int(size / pixscale)
+
+
+    assert exposure.width >= size, f"The size of the full exposure {exposure.width} is smaller than the desired cutout."
+    assert exposure.height >= size, f"The size of the full exposure {exposure.height} is smaller than the desired cutout."
     
     sky_position = geom.SpherePoint(ra, dec, geom.degrees)
     pix_position = geom.PointI(wcs.skyToPixel(sky_position))
@@ -405,11 +445,11 @@ def cutout_exposure(exposure, ra, dec, size = 101, size_units = 'pixel'):
 
 
     if xmin < X0:
-        xmax += np.abs(xmin)
+        xmax += np.abs(xmin - X0)
         xmin = X0
 
     if ymin < Y0:
-        ymax += np.abs(ymin)
+        ymax += np.abs(ymin - Y0)
         ymin = Y0
 
     if xmax > X1:
@@ -474,7 +514,7 @@ def filter_sources_v0(sources, cutout, buffer = 2):
 
 
 
-def filter_sources(sources, cutout, buffer = 2):
+def filter_sources(sources, cutout, buffer = 50):
     '''
     This will only keep only sources whose entire footprint is within cutout bbox.
     
@@ -588,6 +628,41 @@ def warp_exposure(exposure1, exposure2, config = None):
 
 
 
+def set_logging_level(level):
+    '''
+    Allows users to set the logging level of various Rubin pipelines
+    '''
+    
+    assert level in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], "level should be set to either DEBUG, INFO, WARNING, ERROR, CRITICAL"
+
+    task_names = ['lsst.alardLuptonSubtract', 'lsst.visitInjectTask',
+             'lsst.measurement','lsst.sourceDetection','lsst.sourceDeblend']
+
+    
+    for tn in task_names:
+        logger = logging.getLogger(tn)
+        level_ = getattr(logging, level)
+        logger.setLevel(level_)  
+
+
+
+def open_or_create_csv(filepath):
+    if os.path.exists(filepath):
+        df = pd.read_csv(filepath)
+    else:
+        df = pd.DataFrame()
+    return df 
+
+
+
+
+
+
+
+### ============== ###
+### Exposure masks ###
+### ============== ###
+
 
 def compare_mask_dictionaries(exp1, exp2):
     '''
@@ -609,23 +684,72 @@ def compare_mask_dictionaries(exp1, exp2):
     else:
         print("Mask plane dictionaries match.")
 
+        
 
-def set_logging_level(level):
+
+
+def check_mask(exposure, mask_list = ["EDGE", "BAD", "NO_DATA"], coords = None):
     '''
-    Allows users to set the logging level of various Rubin pipelines
+    Check mask for any specific masks. True if that specific mask is found, False otherwise.
+    If you specify coordinates, it will look at those coordinates. If not, it will return the entire array.
+    Coordinates must be ra/dec.
     '''
-    
-    assert level in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], "level should be set to either DEBUG, INFO, WARNING, ERROR, CRITICAL"
 
-    task_names = ['lsst.alardLuptonSubtract', 'lsst.visitInjectTask',
-             'lsst.measurement','lsst.sourceDetection','lsst.sourceDeblend']
+    # Get mask and actual mask array from exposure
+    mask = exposure.getMask()
+    mask_array = mask.array
+    
+    
+    # Combine all the bitmasks in mask_list
+    combined_bitmask = 0
+    for plane in mask_list:
+        combined_bitmask |= mask.getPlaneBitMask(plane)
+    
 
+    masked_pixels = (mask_array & combined_bitmask) != 0 #True where this mask appears
+
+    if coords == None:
+        return masked_pixels
+
+    x,y = sky_to_pixel(coords, exposure.getWcs())
+
+    # Account for bbox difference. Templates don't start at (x,y) = (0,0)
+    bbox = mask.getBBox()
+    xmin = bbox.getMinX()
+    ymin = bbox.getMinY()
+    y = y - ymin 
+    x = x - xmin  
+
+    return masked_pixels[int(y),int(x)]
+
+
+
+
+def get_mask_info(exposure, coords = None): 
+    '''
+    At specific coords (in ra/dec), check what its mask says.
+    '''
+
+    assert coords != None, 'Need coordinates, in RA/Dec'
+    x,y = sky_to_pixel(coords, exposure.getWcs())
+
+    # Get mask and actual mask array from exposure
+    mask = exposure.getMask()
+    mask_array = mask.array
+
+
+    # Account for bbox difference. Templates don't start at (x,y) = (0,0)
+    bbox = mask.getBBox()
+    xmin = bbox.getMinX()
+    ymin = bbox.getMinY()
+    y = y - ymin 
+    x = x - xmin  
     
-    for tn in task_names:
-        logger = logging.getLogger(tn)
-        level_ = getattr(logging, level)
-        logger.setLevel(level_)  
+    mask_value = mask_array[int(y),int(x)]
     
+    return mask.interpret(mask_value)
+    
+        
 
 
 
@@ -903,9 +1027,9 @@ def find_smoothened_injection_locations(exposure, coor, smooth_function = 'media
 
 
 
-def create_injection_locations(science_exposure, n_injections, max_per_round = 100, sn_position = [], template_exposure = [], method = 'smooth', plot = False, plot_zoom = False, 
+def create_injection_locations(science_exposure, n_injections, max_inj_per_round = 100, sn_position = [], template_exposure = [], method = 'smooth', plot = False, plot_zoom = False, 
                               plot_zoom_size = 40, smooth_function = 'median', smooth_filter_size = 10, p_threshold = 5, psf_flux_threshold = 0.001, psf_sigma = 0,
-                              max_dist = 50, radius_increment = 2, min_dist_across_iterations = 0.4, n_attempts = 10):
+                              max_dist = 50, radius_increment = 2, min_dist_across_iterations = 0.4, n_attempts = 100):
 
     '''
     sn_position must be in ra/dec
@@ -922,36 +1046,47 @@ def create_injection_locations(science_exposure, n_injections, max_per_round = 1
     assert method in ['random','smooth'], "method has to be either 'random' or 'smooth'"
 
     if method == 'random':
-        injection_locations = find_random_injection_locations(n_injections*20, science_exposure, output_units = 'sky')
+        injection_locations = find_random_injection_locations(n_injections*20, science_exposure, output_units = 'sky', sn_max_dist = max_dist, sn_loc = sn_position)
         
     elif method == 'smooth':
         assert sn_position != [] and template_exposure != [],"Please provide a SN location and a template exposure to use the smooth method"
         injection_locations, smoothened_exposure = find_smoothened_injection_locations(template_exposure, sn_position, smooth_function = smooth_function, smooth_filter_size = smooth_filter_size, p_threshold = p_threshold, output_units = 'sky')
-        
-        
+    
         assert len(injection_locations) >= n_injections, "Couldn't find enough possible injection locations. Please incresase p_threshold."
 
+    
+    # Remove locs that are not in the image
+    injection_locations = remove_out_of_bounds_locations(injection_locations, science_exposure)
+    if template_exposure != []:
+        injection_locations = remove_out_of_bounds_locations(injection_locations, template_exposure)
 
+    
+
+    injection_locations = remove_faraway_locations(injection_locations, sn_position, max_dist/3600) 
+    
+
+    ### Step 1.5: If a very high number of possible locations are found, randomly select a subset. Otherwise the next step takes forever
+    if len(injection_locations) > n_injections**3 and len(injection_locations) > 20000:
+        injection_locations = random.sample(injection_locations, k = n_injections**3)
+
+    
     ### Step 2: Filter out locations that are too close to the current SN
     min_dists = create_min_dists(science_exposure, injection_locations, psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
-
 
     if sn_position != []: # Also filter out any injection locations that are too close (or too far away) to SN position
 
         sn_min_dist = create_min_dists(science_exposure, [sn_position], psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
-        injection_locations, min_dists = filter_injection_locations(injection_locations,min_dists,[sn_position], sn_min_dist, remove_max_dists = [max_dist/3600])
-
-
+        injection_locations, min_dists = filter_injection_locations(injection_locations,min_dists,[sn_position], sn_min_dist, remove_max_dists = [max_dist/3600])    
     assert len(injection_locations) >= n_injections, "Couldn't find enough possible injection locations. Please relax criteria by e.g. increasing p_threshold if method = smooth."
 
-
+    
     
     ### Step 3: Find good combination of locations to inject together.
     # Since it is a random process, try a few times, see if it works. 
     found_injection_locations = False
     for i_attempt in range(n_attempts):
         try:
-            injection_locations = create_injection_list(injection_locations, min_dists, n_injections, max_per_round = max_per_round, min_dist_across_iterations = min_dist_across_iterations)
+            injection_locations = create_injection_list(injection_locations, min_dists, n_injections, max_inj_per_round = max_inj_per_round, min_dist_across_iterations = min_dist_across_iterations)
             found_injection_locations = True
             break
         except:
@@ -1003,9 +1138,41 @@ def create_injection_locations(science_exposure, n_injections, max_per_round = 1
     
 
     return injection_locations
+
+
+
     
     
-    
+
+
+
+def remove_out_of_bounds_locations(locs, exposure):
+    new_locs = []
+    for loc in locs:
+        if in_exposure(loc, exposure, buffer = 5):
+            new_locs.append(loc)
+    return new_locs
+
+
+
+
+def remove_faraway_locations(locs, target, max_dist):
+    '''
+    Remove any injection location that is 
+    '''
+
+    keep = [True] * len(locs)
+    dist_matrix = distance_matrix(locs, [target])
+
+    for i,l in enumerate(locs): #Go over every possible position
+         dist = dist_matrix[i][0]
+         if dist > max_dist:
+             keep[i] = False
+             
+    return np.array(locs)[keep]
+             
+
+
 
 
 def lower_injection_locations(injection_locations, n):
@@ -1047,7 +1214,7 @@ def filter_injection_locations(locs, min_dists, remove_locs, remove_min_dists, r
 
 
 
-def create_injection_list(locs, min_dists, n_injection, max_per_round = 1000, min_dist_across_iterations = 1):
+def create_injection_list(locs, min_dists, n_injection, max_inj_per_round = 1000, min_dist_across_iterations = 1):
     '''
     If we inject locations one-by-one, then algorithm takes forever. Here, we will identify locations that you 
     are able to inject together
@@ -1058,7 +1225,7 @@ def create_injection_list(locs, min_dists, n_injection, max_per_round = 1000, mi
     locs: list of possible injection sites, in pixel units
     min_dists: list of how far away each injection site has to be from others
     n_injection: how many to select in total
-    max_per_round: how many injections to maximum put in one round. Can set this to 1 if you want to disable this feature
+    max_inj_per_round: how many injections to maximum put in one round. Can set this to 1 if you want to disable this feature
     min_dist_across_iterations: in arcsec. even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within X arcsec as unuseable.
 
 
@@ -1109,7 +1276,7 @@ def create_injection_list(locs, min_dists, n_injection, max_per_round = 1000, mi
         # Sufficiently far away from any already added this iteration and not 
         # used before.
         still_possible_targets = True
-        while still_possible_targets and len(temp) < max_locs_needed and len(temp) < max_per_round:
+        while still_possible_targets and len(temp) < max_locs_needed and len(temp) < max_inj_per_round:
             possibilities = list(range(len(locs)))
             for idx in temp:
                 possible = np.where( (dist_matrix[idx] > min_dists[idx]) & (used == False))[0]
@@ -1640,43 +1807,223 @@ def sample_sn_mags(df, sn_mag, n_mag_step, buffer, mag_limits):
 
 
 
+injection_configs = {
+    0 : {
+    'max_dist' : 20,
+    'p_threshold' : 5,
+    'psf_flux_threshold' : 0.0001,
+    'psf_sigma' : 3,
+    'min_dist_across_iterations' : 2,
+    'max_inj_per_round' : 1000
+    }, 
+    1 : {
+    'max_dist' : 20,
+    'p_threshold' : 5,
+    'psf_flux_threshold' : 0.001,
+    'psf_sigma' : 1,
+    'min_dist_across_iterations' : 1,
+    'max_inj_per_round' : 1000
+    }, 
+    2 : {
+    'max_dist' : 20,
+    'p_threshold' : 5,
+    'psf_flux_threshold' : 0.001,
+    'psf_sigma' : 0,
+    'min_dist_across_iterations' : 0.4,
+    'max_inj_per_round' : 1000
+    }, 
+    3 : {
+    'max_dist' : 20,
+    'p_threshold' : 5,
+    'psf_flux_threshold' : 0.001,
+    'psf_sigma' : 0,
+    'min_dist_across_iterations' : 0.0,
+    'max_inj_per_round' : 1
+    }, 
+    4 : {
+    'max_dist' : 40, #allow targets to be found in other galaxies
+    'p_threshold' : 5,
+    'psf_flux_threshold' : 0.001,
+    'psf_sigma' : 0,
+    'min_dist_across_iterations' : 0.0,
+    'max_inj_per_round' : 1
+    }
+}
+
+
 
 
 class recovery_curve_config:
     '''
-    Description parameters
+    Description
+    -----------
 
+    This class is used to tweak additional settings for the `recovery_curve()` function. You can best think of this as simply a container of information that specifies a bunch of the settings of `recovery_curve`. 
+
+
+    Parameters
+    ----------
+
+    --- Parameters related to magnitude sampling ---
     We try to be smart while sampling the recovery curve. We will have multiple rounds of sampling and slowly zoom in to the
     region where the curve goes from 1 to 0. The following parameters define this process.
-    n_mag_steps: list of ints. Defines how many mag steps in each iteration. Better to start low, and go up. 
-    sampling_buffer: float. During the first iteration, we create a range around the sn_mag. The buffer defines how far out on each side. 
-    mag_limits: list of floats. If the transition region is not found in the first iteration, we simply set the limits of the search to this.
-
-    Related to image smoothing:
-    smooth_function: the function used to smooth
-    smooth_filter_size: int. The size of the filter, in pixels
-
-    Related to finding injection locations:
-    injection_method: can be either 'random' or 'smooth'. When random, we just return random pixels in the inmage. When smooth, we first smooth the template image, and then try to find pixels that are similar to the target SN. Very highly recommended to use smooth.
-    n_injections: int or list of ints. The amount of injections at each iteration. The precision on the detection fraction depends on this. E.g. if n_injections = 10, then we will only be precise with steps of 0.1 (i.e. 1/n_injections).
-    max_inj_per_round: int. The maximum number of injections done per injection iteration. 
-    p_threshold: int. We try to find injection sites that are similar to the target SN. Every injection site will be p_threshold percent within the value of the pixel at the SN location in the template image.
-    psf_flux_threshold: float. Used when creating the injection iterations. We do not want to plce injection sites too close together. We look at the PSF of each injection location and find the distance at which 1 - psf_flux_threshold of the flux of the normalized PSF is contained and make sure to exclude other sites within that range.
-    psf_sigma: In addition to the above, we also calculate the std of the PSF and add a psf_sigma multiple of that to this radius. 
-    min_dist_across_iterations: even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within X arcsec as unuseable.
-    injection_n_attempts: Since the creation of the final injection locations from all the possible injection locations is a random process, we try a few times, and see if there is a suitable solution.
-    max_dist: (float) the maximum distance, in arcsec, away from the SN that the injection locations can be. 
-    inject_band: str. Band to inject in. Default 'g'. 
     
-    Remaining parameters:
-    subtraction_config: We use the AlardLuptonSubtractTask to do the subtraction. Note that you can also pass a `config` parameter to `subtract_images()`. This should be a `lsst.ip.diffim.subtractImages.AlardLuptonSubtractConfig`. This allows you to finetune the details of the subtraction. If you do not specify this parameter, we will use the default config. Strongly recommended to keep this to default, unless you're confident in what you want to change. 
-    snr_threshold: float. What SNR threshold defines a detection. Default Rubin value is 5. 
-    subtract_background: bool. Whether or not to automatically subtract the background.
-    cutout_size: int. We recommend to input the full images, but we fill create a cutout ourselves for the majority of the tasks to speed things up. Units are arcsec. Default is NaN, but very highly recommended to use a value. It needs to be high enough to still include other sources for the subtraction. Around 300 seems  usually appropriate.
-    sn_position_units: string. Whether the sn_position is in pixel units or sky units.
-    plot: Whether to automatically output plots.
-    expand_output: bool. If True, we expand the output to contain much more detail. You can recover the summarised dataframe by doing: `df_recovery = recovery_summary(df_expanded_output)`
-    n_jobs: Used to specify how many parallel processes should be used to complete this. Should not exceed amount of available CPU cores. Can disable this functionality by doing n_jobs = 0. Parallelisation happens over inject_subtract_photometry() with different sn_mags. 
+    n_mag_steps : list of ints, default = [4,4,4,8,20]
+            It is important to sample the transition region where the detection fraction goes from 1 to 0. This is done in different steps defined by this parameter. This parameter defines how many magnitudes are sampled in each iteration. E.g., n_mag_steps = [4,8], then we will sample four mangitudes in the first step, and then zoom in and sample eight magnitudes in the second step. It is more efficient to start low, and then go up. 
+            
+    sampling_buffer: float, default = 5.0
+            During the first sampling iteration, we start by creating a range around the defined `sn_mag`. The buffer defines how far out on each side. 
+
+    mag_limits: list of floats, default = [10,30]
+            The min and max value to sample. If the transition region is not found in the first iteration, we simply set the limits of the search to these values. 
+
+
+    --- Parameters related to template image smoothening --- 
+    
+    smooth_function: string, default = 'median'
+            Can either be 'mean' or 'median'. This will change what function we use to smooth.
+            
+    smooth_filter_size: int, default = 10
+            The size of the filter, in pixels.
+
+
+    --- Parameters related to finding injection locations ---
+
+    
+    injection_method : string, default = 'random'
+            This determines which method we use to find injection locations. It can be either 'random' or 'smooth'. When random, we just return random pixels in the image. When smooth, we first smooth the template image, and then try to find pixels that are similar to the target SN. Very highly recommended to use smooth. Random was only implemented for debugging purposes.
+    
+    n_injections : int or list of ints, default = 10
+            The amount of injections we perform. The precision on the detection fraction depends on this. E.g., if n_injections = 10, then we will only be precise with steps of 0.1 (i.e. 1/n_injections). 
+    
+    max_inj_per_round : int, default = 100
+            The maximum number of injections done within each injection iteration. We try to speed the code up by selecting injection locations that can be injected, subtracted, and measured simultaneously without influencing each other. If you do not want this behaviour, and prefer to only inject one fake source at the time, you can set this variable to 1.  
+    
+    p_threshold : int, default = 5
+            We try to look for injection sites that are similar to the target SN. Every injection site will be p_threshold percent within the value of the pixel at the SN location in the template image.
+    
+    psf_flux_threshold : float, default = 0.001 
+            This parameter is used when used when creating the different injection iterations. We do not want to place injection sites too close together within one injection iteration. We look at the PSF of each injection location and find the distance at which 1 - psf_flux_threshold of the flux of the normalized PSF is contained and make sure to exclude other sites within that range for each injection iteration. For example, if psf_flux_threshold = 0.001, then we will only place injection locations within the same injection iteration if they can be separated by the distance that constains 99.9% of the flux of the normalized PSF.
+    
+    psf_sigma : foat, default = 0
+            In addition to the above, we also give the option to calculate the std of the PSF and add a psf_sigma multiple of that to this radius. 
+    
+    min_dist_across_iterations : float, default = 0.4
+            Even across injection iterations, we don't simply want to take the next pixel over. So whenever we find a suitable injection location, also mark all the other possible ones that are within min_dist_across_iterations arcsec as unuseable.
+    
+    injection_n_attempts : int, default = 100
+            Since the creation of the final injection locations from all the possible injection locations is a random process, we try a multiple times, and see if there is a suitable solution. There might not be a solution for the current settings. Try injection_n_attempts times ot find a solution. If none was found, we advise to relax the criteria above.
+    
+    max_dist : float, default = 50
+            The maximum distance, in arcsec, away from the SN that the injection locations can be. 
+            
+    band: str, default = 'g'
+            Which band to inject in. This is deprecated -- you don't need to specify this anymore. 
+
+
+    --- Parameters related to saving the output of DETECT ---
+    DETECT takes a while to run. It might be wise to save the output of DETECT, rather than running it again on your target every time you're working on it. You can certainly save the output yourself. Alternatively, we have implemented an automated saving method. See the information below under 'Notes' for more information.
+
+    save_output : bool, default = False. 
+            This determines whether the output gets saved. If True, we need also need all the parameters below to be defined.   
+    
+    output_dir : str or None, default = None
+            Directory where all the DETECT output should be saved. 
+    
+    name : str or None, default = None
+            The name of this target. All targets with the same name will be saved in the same folder. 
+    
+    visit : int or None, default = None
+            Every observation in Rubin LSST is uniquely defined by its visit and detector number. Get this from the Rubin tables. We will save every epoch of this target using a combination of the visit and detector numbers.   
+    
+    detector : int or None, default = None
+            Every observation in Rubin is uniquely defined by its visit and detector number. Get this from the Rubin tables. We will save every epoch of this target using a combination of the visit and detector numbers.   
+    
+    mjd : float or None, default = None
+            The MJD of this observation.   
+    
+    detection_thresholds : list of floats, default = [0.5, 0.8]. 
+            These are the detections thresholds that we will automatically solve for and save.   
+
+    current_date : string, default = time.strftime('%Y%m%d')
+            The current date when the code is run. 
+
+
+    --- The remaining parameters ---
+
+
+    subtraction_config : None or lsst.ip.diffim.subtractImages.AlardLuptonSubtractConfig, default = None,
+            We use the Rubin LSST's `AlardLuptonSubtractTask` to do image subtraction. You can specify the details of the image subtraction process by specifying a `lsst.ip.diffim.subtractImages.AlardLuptonSubtractConfig` here. If you do not specify this parameter, we will use the default config. Strongly recommended to keep this to default, unless you are very confident in what you want to change. 
+    
+    snr_threshold : float, default = 5.0
+            This defines what the SNR threshold is before an epoch gets counted as a detection. The default Rubin LSST value is 5, which we recommend to keep
+    
+    subtract_background : bool, default = True
+            Whether or not to automatically subtract the background from out injection locations.
+    
+    cutout_size : int or np.nan, default = np.nan
+            If specified, we will automatically create cutouts of the exposures of size `cutout_size` x `cutout_size` arcsec to speed various parts of the code up. BY default, this behaviour is disabled. However, doing this speeds things up *significantly* and we highly recommend doing this. The only caveat is that there should still be enough sources in the background to do the image subtraction with. About 200 sources typically seems good, which usually corresponds to a cutout_size of roughly 400 arcsec. More sources are better, at the cost of time. If you receive a warning from `alardLuptonSubtract` that the `Spatial background model poorly constrained`, consider increasing the `cutout_size`.
+
+    
+    sn_position_units : string, default = 'sky'
+            This specifies whether the `sn_position` is in pixel units or sky units.
+    
+    plot : bool, default = False
+            This specifies whether to automatically produce plots of the output.
+    
+    expand_output : bool, default = False
+            By default, `recovery_curve` will output a pandas dataframe that summarizes the output. If `expand_output = True`, then we expand the output to contain much more detail of every injcetion location across all injection iterations. You can recover the summarised dataframe by doing: `df_recovery = recovery_summary(df_expanded_output)`
+    
+    n_jobs: int, default = 0
+            This is used to specify how many parallel processes should be used to calcualte the recovery curve. This value should not exceed amount of available CPU cores. Can disable this functionality by doing n_jobs = 0 (which is the default value). Parallelisation happens over inject_subtract_photometry() with different sn_mags. We highly recommend to use this functionality as this will speed up things significantly. 
+
+
+                
+    Returns
+    -------
+
+    Intializes a recovery_curve_config that you can use to change the settings of `recovery_curve()`.
+
+
+
+
+    Example
+    -------
+
+    config = recovery_curve_config() #Initialize the default settings
+    config.cutout_size = 400 # change to default value of `cutout_size`
+
+    
+    Notes
+    -----
+
+    We highly recommend to follow the tutorial in `tutorial.ipynb`! This can clarify a lot of your outstanding questions.
+
+    Have a look at help(recovery_curve).
+
+
+    --- A note on saving output --- 
+
+    If you are saving the output of detect autmatically (i.e., `config.save_output = True`), the output is saved according to this file structure:
+
+    output_dir/
+        ├── name1/
+        │   ├── overview.csv
+        │   ├── visit_detector/
+        │   │   ├── detailed.csv
+        │   │   ├── summarized.csv
+        │   │   ├── config.yaml
+        │   │   └── any_additional_plots.png
+        │   │
+        │   ├── visit_detector/ 
+        │       └── ...
+        │
+        └── name2/
+            └── ...
+
+
+    We will automatically combine output for the same target (i.e. with the same `name`) into the same folder. Within each target folder, we have an overview table (aptly named `overview.csv`) that will list list basic information of this target, as well as the detection thresholds defined in `detection_thresholds`. Then, we save more output per epoch, sorted by detector and visit id. Within the subfolder of each epoch, we show a summarized and extended output table, corresponding to the summarised or extended output of `recovery_curve`. The summarized output contains information about every `sn_mag` tested, and what fraction of injection locations were detected at that magnitude. The detailed output contains information about each individual injection location and whether it was detected at each tested magnitude. We also save the settings of the config object in `config.yaml`, as well as some additional useful diagnostic plots. 
+                
     '''
 
     
@@ -1688,25 +2035,24 @@ class recovery_curve_config:
         self.mag_limits = [10,30]
 
         # Image smoothing
-        self.injection_method = 'smooth'
         self.smooth_function = 'median'
         self.smooth_filter_size = 10
         
         # Finding injection locations
+        self.injection_method = 'smooth'
         self.n_injections = 10
         self.max_inj_per_round = 100
         self.p_threshold = 5
         self.psf_flux_threshold = 0.001
         self.psf_sigma = 0
         self.min_dist_across_iterations = 0.4
-        self.injection_n_attempts = 10
+        self.injection_n_attempts = 100
         self.max_dist = 50
-        self.inject_band = 'g'
+        self.band = 'g'
 
-        #Subtraction
-        self.subtraction_config = None
-    
+        
         # Varia
+        self.subtraction_config = None
         self.snr_threshold = 5
         self.subtract_background = True
         self.cutout_size = np.nan
@@ -1714,6 +2060,34 @@ class recovery_curve_config:
         self.plot = False
         self.expand_output = False
         self.n_jobs = 0
+
+
+        # Saving results
+        self.save_output = False
+        self.output_dir = None
+        self.name = None
+        self.visit = None
+        self.detector = None
+        self.mjd = None
+        self.detection_thresholds = [0.5,0.8]
+        self.current_date = time.strftime('%Y%m%d')
+
+
+
+    def set_injection_config(self, level):
+        assert level >= 0, "level should be between 0 (for larger galaxies) and 4 (for smaller galaxies)"
+        assert level <= 4, "level should be between 0 (for larger galaxies) and 4 (for smaller galaxies)"
+        
+        injection_config = injection_configs[level]
+
+        self.p_threshold = injection_config['p_threshold']
+        self.psf_flux_threshold = injection_config['psf_flux_threshold']
+        self.psf_sigma = injection_config['psf_sigma']
+        self.min_dist_across_iterations = injection_config['min_dist_across_iterations']
+        self.max_dist = injection_config['max_dist']
+        self.max_inj_per_round = injection_config['max_inj_per_round']
+        
+        
 
 
     def save_settings(self, filename):
@@ -1729,22 +2103,93 @@ class recovery_curve_config:
         # Set each attribute from the dict
         for key, value in settings_dict.items():
             setattr(self, key, value)
-    
 
+
+
+        
         
 
 
 def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_position, config = None):
     '''
-    You have an LSST science exposure (calexp) and template exposure (coadd). There is a SN in the science exposure of magnitude sn_mag. It is embedded
-    in a background galaxy. This function will help to decide whether the detection is real
+    Description
+    -----------
+
+    This is the main function of DETECT. We assume you have a Rubin scienc exposure and template exposure. There is a target in the science exposure for which you want to calculate a reliable recovery curve (and eventually upper limits). The target has a magnitude of `sn_mag` and is at location `sn_position`. It is embedded in a background galaxy. This function will help to decide whether the detection is real
     or not by creating a recovery curve.
 
-    sn_mag: magnitude of the supernova.
-    science_exposure: lsst.afw.image._exposure.ExposureF that contains the SN. Typically a calexp
-    template_exposure: lsst.afw.image._exposure.ExposureF of the same field without the SN. Typically a coadd.
-    sources: a SourceCatalog of all the sources in the science exposure. Used to do the subtraction.
-    sn_position: the position of the SN, in pixel coordinates
+
+
+
+    Parameters
+    ----------
+
+    sn_mag : float
+            Magnitude of the supernova (or target). This will be used to probe the region around this magnitude space first. Thus, it is not crucial that this is super accurate. 
+            
+    science_exposure : lsst.afw.image._exposure.ExposureF
+            The science exposure that contains the SN. This should be the full exposure, not a cutout. We create cutouts ourselves (see `config.cutout`) where appropriate.
+
+    template_exposure : lsst.afw.image._exposure.ExposureF
+            The template exposure of the same field. This should be a coadded image. This should be the full exposure, not a cutout. We create cutouts ourselves (see `config.cutout`) where appropriate.
+
+    sources : lsst.afw.table.SourceCatalog
+            A SourceCatalog with all the other sources in the science and template exposure. This is needed during the image subtraction. Can find them with: `source_detection(exposure)`.
+
+    sn_position : tuple
+            A tuple with the ra and dec of the target. 
+
+    config : None or detect.recovery_curve_config, default = None
+            This config argument contains all extra configuration parameters to finetune the DETECT pipeline. By default, this will be None, in which case we use the default settings. Run `help(recovery_curve_config)` for more details on all the parameters that you can tune. 
+
+
+                
+    Returns
+    -------
+
+    df : pandas.DataFrame
+            The output of this function is a pandas dataframe. By default, this will be a summarizes output (recommended for most use-cases). However, you can request more detailed output by doing `config.expand_output = True`. A description of the columns in this database is given below, under "Notes".
+
+
+
+    Example
+    -------
+
+    df_recovery = recovery_curve(sn_mag = sn_mag, science_exposure = calexp, template_exposure = template, sources = sources, sn_position = (ra_sn,dec_sn))
+
+
+    
+    Notes
+    -----
+
+
+    We highly recommend to follow the tutorial in `tutorial.ipynb`! This can clarify a lot of your outstanding questions.
+
+
+    Have a look at help(recovery_curve_config) to see how you can change more settings. 
+    
+
+    --- A note on column outputs ---
+
+    By default, this function will return a pandas dataframe with the summarizes results. This is recommended for most use-cases. It contains the following columns:
+
+    sn_mag : float, which test magnitude this row corresponds to
+    base_PsfFlux_nJy : float, the mean flux in nJy in the difference image from forced photometry at the injection locations after injecting a source with `sn_mag` magnitude. 
+    base_PsfFlux_nJyErr : float, the mean error in the flux in nJy in the difference image from forced photometry at the injection locations after injecting a source with `sn_mag` magnitude. 
+    base_PsfFlux_SNR : float, the mean SNR from forced photometry at the injection locations after injecting a source with `sn_mag` magnitude. 
+    detected : float, between 0 and 1. The fraction of injected sources that were recovered (i.e., SNR > 5) at this `sn_mag`.
+    background_nonzero_flag : float, between 0 and 1. The fraction of sources with signficant background flux. 
+
+    You can plot the recovery curve with this information by simply doing: `plt.plot(df['sn_mag'], df['detected'])`. You can get X detection threshold by doing: `mag_limits = find_thresholds(df ,detection_fraction_thresholds = [X])`.
+
+
+    You can get a more detailed output by doing: `config.expand_output = True`, in which case you will get detailed information about each separate injection location. 
+
+
+
+
+
+    
     '''
     if config == None:
         config = recovery_curve_config()
@@ -1807,15 +2252,15 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
     if config.injection_method == 'random':
         injection_locations = create_injection_locations(science_cutout, np.max(config.n_injections), sn_position = sn_position, 
                                                          method = 'random', psf_flux_threshold = config.psf_flux_threshold, 
-                                                         psf_sigma= config.psf_sigma, max_per_round = config.max_inj_per_round,
+                                                         psf_sigma= config.psf_sigma, max_inj_per_round = config.max_inj_per_round,
                                                          min_dist_across_iterations = config.min_dist_across_iterations, 
-                                                         n_attempts = config.n_attempts, max_dist = config.max_dist)
+                                                         n_attempts = config.injection_n_attempts, max_dist = config.max_dist)
 
     if config.injection_method == 'smooth':
         injection_locations = create_injection_locations(science_cutout, np.max(config.n_injections), sn_position = sn_position, method = 'smooth', template_exposure = template_cutout, 
                                                         smooth_function = config.smooth_function, smooth_filter_size = config.smooth_filter_size,
                                                          p_threshold = config.p_threshold, psf_flux_threshold = config.psf_flux_threshold, 
-                                                         psf_sigma = config.psf_sigma, max_per_round = config.max_inj_per_round,
+                                                         psf_sigma = config.psf_sigma, max_inj_per_round = config.max_inj_per_round,
                                                          min_dist_across_iterations = config.min_dist_across_iterations, 
                                                          n_attempts = config.injection_n_attempts, max_dist = config.max_dist)
 
@@ -1852,7 +2297,7 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
                                   sources = sources, injection_locations = injection_locations_temp,
                                   template_exposure = template_exposure, cutout_size = config.cutout_size,
                                   sn_position = sn_position, subtraction_config = config.subtraction_config, 
-                                  band = config.inject_band)
+                                  band = config.band)
                 
                 df_temp['sn_mag'] = sn_mag_inject        
                 df_results = pd.concat([df_results,df_temp])
@@ -1864,7 +2309,7 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
                                         sources = sources, injection_locations = injection_locations_temp,
                                         template_exposure = template_exposure, cutout_size = config.cutout_size,
                                         sn_position = sn_position, subtraction_config = config.subtraction_config,
-                                        band = config.inject_band
+                                        band = config.band
                                         )
 
                 args = [(science_exposure, sn_mag_inject) for sn_mag_inject in sn_mags_inject]
@@ -1908,6 +2353,11 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
     
     df_results_full = df_results_full.sort_values(by = 'sn_mag').reset_index(drop=True)
     df_summary = recovery_summary(df_results_full)
+
+    
+    if config.save_output:
+        save_results(df_results_full, config, sn_position, science_exposure, template_exposure, injection_locations)
+        
     
     if config.plot:
         plt.figure(figsize = (5,3))
@@ -1923,6 +2373,137 @@ def recovery_curve(sn_mag, science_exposure, template_exposure, sources, sn_posi
     else: 
         return df_summary
 
+
+
+def save_results(df_results_full, config, sn_position, science, template, injection_locations):
+    '''
+    Example file structure
+
+    output_dir/
+        ├── name1/
+        │   ├── overview.csv
+        │   ├── visit_detector/
+        │   │   ├── detailed.csv
+        │   │   ├── summarized.csv
+        │   │   ├── config.yaml
+        │   │   └── any_additional_plots.png
+        │   │
+        │   ├── visit_detector/ 
+        │       └── ...
+        │
+        └── name2/
+            └── ...
+                
+    '''
+
+    # 
+    output_dir = config.output_dir
+    if output_dir[-1] != '/':
+        output_dir = output_dir + '/'
+    name = str(config.name)
+    id_visit = str(config.visit) + '_' + str(config.detector) #A calexp/visit image is uniquely defined by visit+detector
+
+    # Assertions
+    assert config.output_dir is not None, 'You need to specify an output directory to save the results. Run help(recovery_curve_config) and scroll down to "Parameters related to saving the output of DETECT" for more information.'
+    assert config.name is not None, 'You need to specify a name to save the results. Run help(recovery_curve_config) and scroll down to "Parameters related to saving the output of DETECT" for more information.'
+    assert config.visit is not None, 'You need to specify the visit and detector to save the results. Run help(recovery_curve_config) and scroll down to "Parameters related to saving the output of DETECT" for more information.'
+    assert config.detector is not None, 'You need to specify the visit and detector to save the results. Run help(recovery_curve_config) and scroll down to "Parameters related to saving the output of DETECT" for more information.'
+
+
+    # Create file structure
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    if not os.path.exists(output_dir + name):
+        os.makedirs(output_dir + name)
+
+    filepath = output_dir + name + '/' + id_visit + '/'
+    if not os.path.exists(filepath):
+        os.makedirs(filepath)
+
+
+
+    # Save dfs
+    df_summary = recovery_summary(df_results_full)
+    df_results_full.to_csv(filepath + f'detailed_output_{id_visit}.csv', index = False)
+    df_summary.to_csv(filepath + f'summarized_output_{id_visit}.csv', index = False)
+
+    
+    # Save config
+    config.save_settings(filepath+'config.yaml')
+
+    
+    # Open or create csv to add the detection limits
+    mag_limits, popt = find_thresholds(df_summary, detection_fraction_thresholds = config.detection_thresholds, return_popt = True)
+    new_row = {}
+    new_row['visit'] = config.visit
+    new_row['detector'] = config.detector
+    new_row['visit_detector'] = id_visit
+    new_row['mjd'] = config.mjd
+    new_row['ra'] = sn_position[0]
+    new_row['dec'] = sn_position[1]
+    new_row['band'] = config.band
+    new_row = {**new_row, **mag_limits}
+    
+    
+
+
+    new_row = pd.DataFrame([new_row])
+    df_overview = open_or_create_csv(output_dir + name + '/overview.csv')
+    df_overview = pd.concat([df_overview, new_row], ignore_index=True).reset_index(drop=True)
+    df_overview.to_csv(output_dir + name + '/overview.csv', index=False)
+
+    # Save plots
+
+    # Plot 1: Images
+    zoom_target = sn_position
+    plot_zoom_size = 30
+    vmin, vmax = np.nanpercentile(science.image.array,10),np.nanpercentile(science.image.array,99.8)
+
+    fig, ax = plt.subplots(1, 3, figsize=(12,3))
+
+    plot_image(science, ax = ax[0], title = 'Science exposure', zoom_target = zoom_target, zoom_size = plot_zoom_size)
+    plot_image(template, ax = ax[1], title = 'Template exposure', zoom_target = zoom_target, zoom_size = plot_zoom_size)
+    plot_image(template, ax = ax[2], title = 'Injection locations', zoom_target = zoom_target, zoom_size = plot_zoom_size)
+    
+    cols = [f'C{i}' for i in range(len(injection_locations))]
+    for i,idxs in enumerate(injection_locations):
+        for idx in idxs:
+            idx_pix = sky_to_pixel(idx, wcs = template.getWcs())
+            plt.scatter(idx_pix[0], idx_pix[1], facecolor = 'none', edgecolor = cols[i], s = 100)
+
+    sn_position_pix = sky_to_pixel(sn_position, wcs = template.getWcs())
+    plt.scatter(sn_position_pix[0],sn_position_pix[1], facecolor = 'none', edgecolor = 'red', s = 100, marker = 'X')
+
+    plt.tight_layout()
+    plt.savefig(filepath+f'injection_locations.png')
+    plt.close()
+    
+
+    # plot 2: Recovery curve
+    plt.figure(figsize = (10,4))
+    plt.subplot(1,2,1)
+    plt.plot(df_summary['sn_mag'], df_summary['detected'])
+    plt.ylabel('Detection fraction')
+    plt.xlabel('SNe magnitude')
+    
+
+    plt.subplot(1,2,2)
+    xs = np.linspace(np.min(df_summary['sn_mag']), np.max(df_summary['sn_mag']), 10000)
+    plt.plot(xs, piecewise(xs, *popt), c = 'k', label = 'Model', zorder = -1, lw = 1)
+    plt.scatter(df_summary['sn_mag'],df_summary['detected'], label = 'Data')
+
+    for ft in config.detection_thresholds:
+        plt.scatter(mag_limits[f'lim_{ft}'], ft, c = 'C1', marker = '+', zorder = 3, s = 100)
+    plt.scatter([],[], c = 'C1', marker = '+', s = 100, label = 'Thresholds')
+    
+    plt.xlim(popt[0]-0.2,popt[1]+0.2)
+    plt.xlabel('Magnitude')
+    plt.ylabel('Detection fraction')
+    plt.legend()
+    plt.savefig(filepath+f'recovery_curve.png')
+    plt.close()
+    
 
 
 
@@ -1978,7 +2559,7 @@ def measure_background(science, template, injection_locations, sources, subtract
 
 def estimate_sn_background(science, template, sources, sn_position, n_injections = np.inf,
                            sn_position_units = 'sky', cutout_size = np.nan, smooth_function = 'median', 
-                           smooth_filter_size = 10, p_threshold = 2, max_dist = 10, psf_flux_threshold = 0.0001, 
+                           smooth_filter_size = 10, p_threshold = 2, max_dist = 10, psf_flux_threshold = 0.001, 
                            psf_sigma = 1, radius_increment = 2, plot = False, subtraction_config = None):
 
     '''
@@ -2019,6 +2600,15 @@ def estimate_sn_background(science, template, sources, sn_position, n_injections
     injection_locations, _ = find_smoothened_injection_locations(template_cutout, sn_position, smooth_function = smooth_function, 
                                                                smooth_filter_size = smooth_filter_size, p_threshold = p_threshold, 
                                                                output_units = 'sky')
+
+
+    # Remove locs that are not in the image
+    injection_locations = remove_out_of_bounds_locations(injection_locations, science)
+    injection_locations = remove_out_of_bounds_locations(injection_locations, template)
+
+    # Remove locs that are far away
+    injection_locations = remove_faraway_locations(injection_locations, sn_position, max_dist/3600) 
+    
     
     # Remove pixels that are too close (or too far away) from SN. Might be some leaking. 
     min_dists = create_min_dists(science_cutout, injection_locations, psf_flux_threshold = psf_flux_threshold, psf_sigma = psf_sigma, radius_increment = radius_increment)
@@ -2161,7 +2751,7 @@ def piecewise_solver(y,x1,x2):
 
 
 
-def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = [[20,26], [22,25], [23,24], [18,30]], method = 'piecewise', sn_mag = np.nan, plot = False):
+def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = [[20,26], [22,25], [23,24], [18,30]], method = 'piecewise', sn_mag = np.nan, plot = False, return_popt = False):
     '''
     For every item in detection_fraction_thresholds, find the lowest mag that has a higher detection fraction.
     p0 can be a list with initial condition values, e.g.: [22,25]. Or, it can be a list of lists, with multiple p0's to test. Will select the one with the best fit 
@@ -2221,11 +2811,12 @@ def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = 
 
         if plot == True:
 
+
             plt.figure(figsize = (6,4))
             xs = np.linspace(np.min(xs_data), np.max(xs_data), 10000)
 
-            plt.plot(xs, piecewise(xs, *popt), c = 'k', label = 'model', zorder = -1, lw = 1)
-            plt.scatter(xs_data,ys_data, label = 'data')
+            plt.plot(xs, piecewise(xs, *popt), c = 'k', label = 'Model', zorder = -1, lw = 1)
+            plt.scatter(xs_data,ys_data, label = 'Data')
 
             if ~np.isnan(sn_mag):
                 plt.axvline(sn_mag, c = 'k', ls = '--')
@@ -2240,8 +2831,11 @@ def find_thresholds(df_results, detection_fraction_thresholds = [0.5,0.8], p0 = 
             plt.ylabel('Detection fraction')
             plt.legend()
             plt.show()
-            
-        return d
+
+        if return_popt:
+            return d, popt
+        else:
+            return d
 
 
 
@@ -2561,6 +3155,47 @@ def rotate_exposure(exp, n_degrees):
     rotated_exp = warper.warpExposure(rotated_wcs, exp)
     return rotated_exp
 
+
+
+
+def align_exposure(exposure, config = None):
+    '''
+    Rotate an exposure so that it is aligned with the default grid of NWSE (north up, west right).
+    '''
+
+    # Get centre and pixscale
+    ny, nx = exposure.getHeight(), exposure.getWidth()
+    crpix = geom.Point2D(0.5 * nx, 0.5 * ny)
+    pixel_scale_arcsec = exposure.getWcs().getPixelScale().asArcseconds()
+
+    center_pix = exposure.getBBox().getCenter()
+    center_sky = exposure.getWcs().pixelToSky(center_pix)
+    
+    # Create cd matrix
+    pixel_scale_deg = pixel_scale_arcsec / 3600.0
+    
+    cd_matrix = [[-pixel_scale_deg, 0.0],
+                 [0.0, pixel_scale_deg]]
+
+    # Create wcs with aligned axes
+    wcs = afwGeom.makeSkyWcs(crval=center_sky, crpix=crpix, cdMatrix=cd_matrix)
+    
+    # Warp/rotate it
+    if config == None:
+        config = afwMath.Warper.ConfigClass()
+        config.warpingKernelName = "lanczos5"
+    
+    warper = afwMath.Warper.fromConfig(config)
+    warped = warper.warpExposure(wcs, exposure)
+
+    psf = exposure.getPsf()
+    warped.setPsf(psf)
+
+    warped = copy.deepcopy(warped)
+
+    return warped
+
+    
 
 
 class stopwatch:
