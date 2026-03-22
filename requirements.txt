@@ -1,0 +1,10 @@
+numpy # Tested with 2.2.6
+matplotlib # Tested with 3.10.3
+tqdm # Tested with 4.67.1
+astropy # Tested with 7.1.0
+pandas # Tested with 2.3.0
+scipy # Tested with 1.13.1
+pyyaml # Tested with 6.0.2
+
+
+#In addition to the above, you also need the Rubin Science Pipelines. Last tested with the version that was live on the r29.1.1 image on the Rubin Science Platform (RSP).
