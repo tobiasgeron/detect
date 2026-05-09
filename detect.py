@@ -411,8 +411,6 @@ def plot_image_v2(exposure, fig = '', ax = '', scale = 'asinh', vmin = np.nan, v
 
 
 
-    
-
 def cutout_exposure(exposure, ra, dec, size = 101, size_units = 'pixel'):
     '''
     Will create a square cutout with a specific in at exposure around ra/dec value 
@@ -1556,6 +1554,9 @@ def forced_photometry(exposure, coords, return_full = False):
 
 
     Note to self: DP1 has an updated method to do forced photometry. Update this? This new approach also includes aperture photometry etc. 
+
+    psfFlux code: https://github.com/lsst/meas_base/blob/main/include/lsst/meas/base/PsfFlux.h
+    
     '''
 
     if type(coords) == tuple: 
