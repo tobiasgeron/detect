@@ -12,6 +12,8 @@ This is answered using a series of source injection, image subtraction, and forc
 
 Finally, I am happy to help anyone with using this package and welcome feedback or suggestions for features. Please feel free to contact me at tobias.geron@utoronto.ca. I would also appreciate it if you let me know when you use this code in a publication.
 
+Important note: This code currently works for DP1. I have not yet adapted it for DP2. Work in progress, hopefully soon!
+
 
 
 ### Minimal example
