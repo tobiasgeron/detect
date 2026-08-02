@@ -1,6 +1,7 @@
 # DETECT
 
 [![DOI](https://zenodo.org/badge/1005140024.svg)](https://doi.org/10.5281/zenodo.20098337)
+[![ADS](https://img.shields.io/badge/ADS-Paper-blue.svg)](https://ui.adsabs.harvard.edu/abs/2026AJ....172...45G/abstract)
 
 Developed by Tobias Géron at the University of Toronto. Created Summer 2024. Last updated July 2025. This code was last tested using the r29.1.1 image on the RSP. This package is now compatible with DP1. Please see below for a full list of package compatibility.
 
