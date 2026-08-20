@@ -16,6 +16,9 @@ Finally, I am happy to help anyone with using this package and welcome feedback 
 Important note: This code currently works for DP1. I have not yet adapted it for DP2. Work in progress, hopefully soon!
 
 
+![An overview of the DETECT pipeline.](images/detect_overview.png)
+
+
 
 ### Minimal example
 
